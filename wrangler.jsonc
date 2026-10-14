@@ -1,0 +1,7 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "m3u8-security",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-14",
+  "workers_dev": true
+}
