@@ -1,11 +1,14 @@
+const UPSTREAM_URL =
+  "https://github.com/newzooplay/ZooHost/raw/refs/heads/main/hls/index.m3u8";
+
 const COOKIE_NAME = "__Host-m3u_session";
-const TOKEN_TTL = 15 * 60; // 15 minutes
+const TOKEN_TTL = 15 * 60;
 
 function json(data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
-      "Content-Type": "application/json",
+      "Content-Type": "application/json; charset=utf-8",
       "Cache-Control": "no-store",
       "X-Content-Type-Options": "nosniff",
       ...extra
@@ -13,9 +16,12 @@ function json(data, status = 200, extra = {}) {
   });
 }
 
-function b64url(bytes) {
+function encode64(bytes) {
   let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
   return btoa(binary)
     .replace(/\+/g, "-")
     .replace(/\//g, "_")
@@ -24,49 +30,55 @@ function b64url(bytes) {
 
 function decode64(value) {
   const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+
   return Uint8Array.from(
     atob(base64 + "=".repeat((4 - base64.length % 4) % 4)),
-    c => c.charCodeAt(0)
+    char => char.charCodeAt(0)
   );
 }
 
-async function sign(payload, secret) {
-  const key = await crypto.subtle.importKey(
+async function getKey(secret) {
+  return crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(secret),
     { name: "HMAC", hash: "SHA-256" },
     false,
-    ["sign"]
+    ["sign", "verify"]
   );
+}
 
-  const data = b64url(
+async function createToken(secret) {
+  const payload = {
+    exp: Math.floor(Date.now() / 1000) + TOKEN_TTL
+  };
+
+  const data = encode64(
     new TextEncoder().encode(JSON.stringify(payload))
   );
 
   const signature = await crypto.subtle.sign(
-    "HMAC", key, new TextEncoder().encode(data)
+    "HMAC",
+    await getKey(secret),
+    new TextEncoder().encode(data)
   );
 
-  return data + "." + b64url(new Uint8Array(signature));
+  return `${data}.${encode64(new Uint8Array(signature))}`;
 }
 
-async function verify(token, secret) {
+async function verifyToken(token, secret) {
   try {
+    if (typeof token !== "string" || token.length > 2048) {
+      return false;
+    }
+
     const parts = token.split(".");
     if (parts.length !== 2) return false;
 
     const [data, signature] = parts;
-    const key = await crypto.subtle.importKey(
-      "raw",
-      new TextEncoder().encode(secret),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["verify"]
-    );
 
     const valid = await crypto.subtle.verify(
       "HMAC",
-      key,
+      await getKey(secret),
       decode64(signature),
       new TextEncoder().encode(data)
     );
@@ -77,22 +89,27 @@ async function verify(token, secret) {
       new TextDecoder().decode(decode64(data))
     );
 
-    return payload.exp > Math.floor(Date.now() / 1000);
+    return Number.isInteger(payload.exp) &&
+      payload.exp > Math.floor(Date.now() / 1000);
   } catch {
     return false;
   }
 }
 
-function getCookie(request, name) {
-  const cookies = request.headers.get("Cookie") || "";
-  for (const item of cookies.split(";")) {
-    const index = item.indexOf("=");
-    if (index < 0) continue;
+function readCookie(request, name) {
+  const cookieHeader = request.headers.get("Cookie") || "";
 
-    if (item.slice(0, index).trim() === name) {
-      return item.slice(index + 1).trim();
+  for (const part of cookieHeader.split(";")) {
+    const index = part.indexOf("=");
+
+    if (
+      index >= 0 &&
+      part.slice(0, index).trim() === name
+    ) {
+      return part.slice(index + 1).trim();
     }
   }
+
   return "";
 }
 
@@ -101,23 +118,25 @@ export default {
     const url = new URL(request.url);
     const requestId = crypto.randomUUID();
 
-    // Never log passwords, cookies or tokens.
-    const log = status => console.log(JSON.stringify({
-      requestId,
-      path: url.pathname,
-      method: request.method,
-      status,
-      time: new Date().toISOString()
-    }));
+    function log(status) {
+      console.log(JSON.stringify({
+        requestId,
+        path: url.pathname,
+        method: request.method,
+        status,
+        timestamp: new Date().toISOString()
+      }));
+    }
 
-    const origin = request.headers.get("Origin");
     const allowedOrigin = env.ALLOWED_ORIGIN || "";
+    const origin = request.headers.get("Origin");
 
-    const cors = {};
-    if (origin && allowedOrigin && origin === allowedOrigin) {
-      cors["Access-Control-Allow-Origin"] = allowedOrigin;
-      cors["Access-Control-Allow-Credentials"] = "true";
-      cors["Vary"] = "Origin";
+    const corsHeaders = {};
+
+    if (origin && origin === allowedOrigin && allowedOrigin) {
+      corsHeaders["Access-Control-Allow-Origin"] = allowedOrigin;
+      corsHeaders["Access-Control-Allow-Credentials"] = "true";
+      corsHeaders["Vary"] = "Origin";
     }
 
     if (origin && allowedOrigin && origin !== allowedOrigin) {
@@ -125,11 +144,16 @@ export default {
       return json({ error: "Origin denied" }, 403);
     }
 
+    if (!env.ACCESS_PASSWORD || !env.SIGNING_SECRET) {
+      log(503);
+      return json({ error: "Missing server secrets" }, 503);
+    }
+
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
         headers: {
-          ...cors,
+          ...corsHeaders,
           "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
           "Access-Control-Allow-Headers": "Content-Type, Authorization",
           "Access-Control-Max-Age": "600"
@@ -137,35 +161,20 @@ export default {
       });
     }
 
-    if (!env.ACCESS_PASSWORD || !env.SIGNING_SECRET ||
-        !env.UPSTREAM_URL) {
-      log(503);
-      return json({ error: "Server configuration missing" }, 503, cors);
-    }
-
-    // Validate the fixed upstream configuration.
-    let upstream;
-    try {
-      upstream = new URL(env.UPSTREAM_URL);
-      if (upstream.protocol !== "https:") throw new Error();
-    } catch {
-      log(503);
-      return json({ error: "Invalid upstream configuration" }, 503, cors);
-    }
-
-    // Browser login: POST JSON { "password": "..." }
+    // Browser login: POST /login
     if (url.pathname === "/login" && request.method === "POST") {
       if (!request.headers.get("Content-Type")?.includes("application/json")) {
         log(415);
-        return json({ error: "JSON required" }, 415, cors);
+        return json({ error: "JSON required" }, 415, corsHeaders);
       }
 
       let body;
+
       try {
         body = await request.json();
       } catch {
         log(400);
-        return json({ error: "Invalid JSON" }, 400, cors);
+        return json({ error: "Invalid JSON" }, 400, corsHeaders);
       }
 
       if (
@@ -174,34 +183,34 @@ export default {
         body.password !== env.ACCESS_PASSWORD
       ) {
         log(401);
-        return json({ error: "Unauthorized" }, 401, cors);
+        return json({ error: "Unauthorized" }, 401, corsHeaders);
       }
 
-      const token = await sign({
-        exp: Math.floor(Date.now() / 1000) + TOKEN_TTL
-      }, env.SIGNING_SECRET);
+      const token = await createToken(env.SIGNING_SECRET);
 
       log(200);
+
       return json({ authenticated: true }, 200, {
-        ...cors,
+        ...corsHeaders,
         "Set-Cookie":
-          `${COOKIE_NAME}=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${TOKEN_TTL}`
+          `${COOKIE_NAME}=${token}; Path=/; Max-Age=${TOKEN_TTL}; HttpOnly; Secure; SameSite=Strict`
       });
     }
 
-    // IPTV clients: POST JSON password to obtain a short-lived token.
+    // IPTV token: POST /token
     if (url.pathname === "/token" && request.method === "POST") {
       if (!request.headers.get("Content-Type")?.includes("application/json")) {
         log(415);
-        return json({ error: "JSON required" }, 415, cors);
+        return json({ error: "JSON required" }, 415, corsHeaders);
       }
 
       let body;
+
       try {
         body = await request.json();
       } catch {
         log(400);
-        return json({ error: "Invalid JSON" }, 400, cors);
+        return json({ error: "Invalid JSON" }, 400, corsHeaders);
       }
 
       if (
@@ -210,82 +219,106 @@ export default {
         body.password !== env.ACCESS_PASSWORD
       ) {
         log(401);
-        return json({ error: "Unauthorized" }, 401, cors);
+        return json({ error: "Unauthorized" }, 401, corsHeaders);
       }
 
-      const token = await sign({
-        exp: Math.floor(Date.now() / 1000) + TOKEN_TTL
-      }, env.SIGNING_SECRET);
+      const token = await createToken(env.SIGNING_SECRET);
 
       log(200);
-      return json({ token, expires_in: TOKEN_TTL }, 200, cors);
+
+      return json({
+        token,
+        expires_in: TOKEN_TTL
+      }, 200, corsHeaders);
     }
 
     if (!["GET", "HEAD"].includes(request.method)) {
       log(405);
-      return json({ error: "Method not allowed" }, 405, cors);
+      return json({ error: "Method not allowed" }, 405, corsHeaders);
     }
 
-    // Cookie for browsers; Bearer token or ?token= for IPTV.
-    const bearer = request.headers.get("Authorization") || "";
-    const queryToken = url.searchParams.get("token") || "";
-    const cookieToken = getCookie(request, COOKIE_NAME);
+    if (url.pathname !== "/playlist.m3u8") {
+      log(404);
+      return json({ error: "Not found" }, 404, corsHeaders);
+    }
 
-    const token = bearer.startsWith("Bearer ")
-      ? bearer.slice(7)
-      : queryToken || cookieToken;
+    // Browser cookie, IPTV Bearer token, or IPTV query token.
+    const authorization = request.headers.get("Authorization") || "";
+    const bearer = authorization.startsWith("Bearer ")
+      ? authorization.slice(7)
+      : "";
 
-    if (!token || !(await verify(token, env.SIGNING_SECRET))) {
+    const token =
+      bearer ||
+      url.searchParams.get("token") ||
+      readCookie(request, COOKIE_NAME);
+
+    if (!await verifyToken(token, env.SIGNING_SECRET)) {
       log(401);
-      return json({ error: "Authentication required or expired" }, 401, {
-        ...cors,
-        "WWW-Authenticate": "Bearer",
-        "Cache-Control": "no-store"
+
+      return json({ error: "Invalid or expired token" }, 401, {
+        ...corsHeaders,
+        "WWW-Authenticate": "Bearer"
       });
     }
 
-    // Fixed upstream only; no user-supplied upstream URL.
-    if (url.pathname !== "/playlist.m3u8") {
-      log(404);
-      return json({ error: "Not found" }, 404, cors);
+    // Fixed upstream: never accept an arbitrary URL from the client.
+    let upstream;
+
+    try {
+      upstream = new URL(UPSTREAM_URL);
+
+      if (upstream.protocol !== "https:") {
+        throw new Error("HTTPS required");
+      }
+    } catch {
+      log(500);
+      return json({ error: "Invalid upstream configuration" }, 500);
     }
 
-    const headers = new Headers({
-      "Accept": "*/*",
-      "User-Agent": "M3U8-Security-Lab/1.0"
-    });
+    let upstreamResponse;
 
-    let response;
     try {
-      response = await fetch(upstream.href, {
+      upstreamResponse = await fetch(upstream.href, {
         method: request.method,
-        headers,
-        redirect: "manual"
+        headers: {
+          "Accept": "application/vnd.apple.mpegurl, application/x-mpegURL, */*"
+        },
+        redirect: "follow"
       });
     } catch {
       log(502);
-      return json({ error: "Upstream unavailable" }, 502, cors);
+      return json({ error: "Upstream unavailable" }, 502, corsHeaders);
     }
 
-    // Do not follow redirects to arbitrary hosts.
-    if (response.status >= 300 && response.status < 400) {
-      log(502);
-      return json({ error: "Upstream redirect blocked" }, 502, cors);
+    if (!upstreamResponse.ok) {
+      log(upstreamResponse.status);
+
+      return json({
+        error: "Upstream request failed",
+        upstreamStatus: upstreamResponse.status
+      }, upstreamResponse.status, corsHeaders);
     }
 
     const outputHeaders = {
-      ...cors,
+      ...corsHeaders,
       "Cache-Control": "private, no-store",
       "X-Content-Type-Options": "nosniff"
     };
 
-    const contentType = response.headers.get("Content-Type");
-    if (contentType) outputHeaders["Content-Type"] = contentType;
+    const contentType = upstreamResponse.headers.get("Content-Type");
 
-    log(response.status);
+    outputHeaders["Content-Type"] =
+      contentType || "application/vnd.apple.mpegurl";
+
+    log(200);
+
     return new Response(
-      request.method === "HEAD" ? null : response.body,
-      { status: response.status, headers: outputHeaders }
+      request.method === "HEAD" ? null : upstreamResponse.body,
+      {
+        status: 200,
+        headers: outputHeaders
+      }
     );
   }
 };
