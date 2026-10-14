@@ -1,73 +1,99 @@
 name: M3U8 Debugger
 
 on:
-workflow_dispatch:
-inputs:
-playlist_url:
-description: "Authorized M3U8 URL"
-required: true
-type: string
+  workflow_dispatch:
+    inputs:
+      playlist_url:
+        description: "Authorized M3U8 playlist URL"
+        required: true
+        type: string
 
 permissions:
-contents: read
+  contents: read
 
 jobs:
-check:
-runs-on: ubuntu-latest
-steps:
-- name: Setup Python
-uses: actions/setup-python@v5
-with:
-python-version: "3.12"
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
 
-  - name: Inspect playlist
-    env:
-      PLAYLIST_URL: ${{ inputs.playlist_url }}
-    run: |
-      python -m pip install requests
-      python - <<'PY'
-      import os
-      import requests
-      from urllib.parse import urlparse
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      url = os.environ["PLAYLIST_URL"].strip()
-      p = urlparse(url)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      if p.scheme != "https" or not p.hostname:
-          raise SystemExit("Enter a valid HTTPS URL")
+      - name: Install dependencies
+        run: python -m pip install requests
 
-      print("Host:", p.hostname)
+      - name: Inspect M3U8 playlist
+        env:
+          PLAYLIST_URL: ${{ inputs.playlist_url }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+          from urllib.parse import urlparse
 
-      try:
-          r = requests.get(
-              url,
-              headers={"User-Agent": "M3U8-Debugger/1.0"},
-              timeout=20,
-              allow_redirects=True,
-              stream=True
-          )
+          url = os.environ.get("PLAYLIST_URL", "").strip()
+          parsed = urlparse(url)
 
-          print("HTTP status:", r.status_code)
-          print("Redirects:", len(r.history))
-          print("Content-Type:", r.headers.get("Content-Type"))
-          print("Final host:", urlparse(r.url).hostname)
+          if parsed.scheme != "https" or not parsed.hostname:
+              raise SystemExit("ERROR: Enter a valid HTTPS URL.")
 
-          if r.ok:
-              first = next(r.iter_lines(), b"")
-              print("First line:", first[:150].decode(
-                  "utf-8", errors="replace"
-              ))
-              print(
-                  "M3U8 detected:",
-                  first.lstrip().startswith(b"#EXTM3U")
+          if parsed.username or parsed.password:
+              raise SystemExit("ERROR: Credentials in URLs are not allowed.")
+
+          print("Checking playlist host:", parsed.hostname)
+
+          try:
+              response = requests.get(
+                  url,
+                  headers={
+                      "User-Agent": "M3U8-Debugger/1.0",
+                      "Accept": "application/vnd.apple.mpegurl, "
+                                "application/x-mpegURL, */*"
+                  },
+                  timeout=20,
+                  allow_redirects=True,
+                  stream=True
               )
-          else:
-              print("The server returned an HTTP error.")
 
-          r.close()
+              print("HTTP Status:", response.status_code)
+              print("Redirect Count:", len(response.history))
+              print("Final Host:", urlparse(response.url).hostname)
+              print(
+                  "Content-Type:",
+                  response.headers.get("Content-Type", "Unknown")
+              )
 
-      except requests.RequestException as e:
-          print("Request failed:", type(e).__name__)
-          print(str(e)[:250])
-          raise SystemExit(1)
-      PY
+              for index, redirect in enumerate(response.history, start=1):
+                  print(
+                      f"Redirect {index}:",
+                      redirect.status_code,
+                      urlparse(redirect.url).hostname
+                  )
+
+              if response.ok:
+                  first_line = next(response.iter_lines(), b"")
+                  first_line = first_line.decode(
+                      "utf-8", errors="replace"
+                  )
+
+                  print("First line:", first_line[:150])
+                  print(
+                      "M3U8 detected:",
+                      first_line.lstrip().startswith("#EXTM3U")
+                  )
+              else:
+                  print("The server returned an HTTP error.")
+
+              response.close()
+
+          except requests.RequestException as error:
+              print("Request failed:", type(error).__name__)
+              print("Details:", str(error)[:250])
+              raise SystemExit(1)
+          PY
