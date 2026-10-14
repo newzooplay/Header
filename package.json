@@ -1,7 +1,7 @@
 {
   "name": "m3u8-security",
-  "private": true,
   "version": "1.0.0",
+  "private": true,
   "scripts": {
     "deploy": "wrangler deploy src/index.js --name m3u8-security"
   },
