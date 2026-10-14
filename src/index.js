@@ -1,6 +1,6 @@
 
 const UPSTREAM_BASE =
-  "https://raw.githubusercontent.com/newzooplay/ZooHost/main/hls/";
+  "https://tvsen5.aynaott.com/P3y2URgG7LDe/";
 
 const COOKIE_NAME = "stream_session";
 
